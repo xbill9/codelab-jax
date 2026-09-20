@@ -1,0 +1,16 @@
+{
+  "repo": "xbill9/codelab-jax",
+  "branch": "main",
+  "notebooks": {
+    "01_jax_tpu_mechanics.py": {
+      "title": "JAX on TPU: donation, static shapes, and cached state",
+      "accelerator": "TPU",
+      "tpu": "v5e1"
+    },
+    "02_serving_gemma4_on_tpu.py": {
+      "title": "Serving Gemma 4 E2B on a single TPU with pure JAX",
+      "accelerator": "TPU",
+      "tpu": "v5e1"
+    }
+  }
+}

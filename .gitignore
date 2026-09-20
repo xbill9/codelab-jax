@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+.venv/
+# colab exec drops the executed copy beside the input; verify_on_tpu.py moves it
+# into runs/, so one landing here means a run was interrupted.
+notebooks/*_output.ipynb
