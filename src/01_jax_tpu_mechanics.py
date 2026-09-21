@@ -55,20 +55,151 @@ print(f"HBM: {stats.get('bytes_limit', 0) / 1e9:.2f} GB")
 # %% [markdown]
 # ## 1. Why your jitted function keeps recompiling
 #
-# SOURCE: the 128-aligned bucket padding in `~/tpu-jax/ports/gemma4/
-# jax_e_model.py`, and the "padding to 128-aligned TPU buckets does not change
-# model output" claim verified in `~/tpu-jax/tests/test_chunked_prefill.py`.
+# SOURCE: `TPUv6eHardwareProfile` and `pad_to_tpu_v6e_bucket` in
+# `~/tpu-jax/ports/gemma4/jax_e_model.py`, and the pad-slot warning in the same
+# file's windowed-mask docstring.
 #
-# Beats to hit:
-# - Trace a trivial function over sequence lengths 5, 6, 7 -> three compiles.
-# - Show the compile cost with `jax.block_until_ready` and a timer.
-# - Introduce bucketing to 128. Three lengths, one compile.
-# - Then the part tutorials skip: show the padded result is *bitwise identical*
-#   to the unpadded one, so bucketing is free correctness-wise and only costs
-#   wasted FLOPs.
+# `jit` compiles per *shape*, not per function. A prompt one token longer is a
+# new shape, so it is a new compile — and in a server that means the first
+# request at every length pays for a compile nobody asked for.
+#
+# The fix is to round the sequence length up to one of a few fixed buckets. The
+# source engine uses `(64, 128, 256, 512, 1024, 2048, 4096, 8192)`, all
+# 128-aligned because the MXU is a 128x128 systolic array.
+#
+# The part that is easy to get wrong is what padding costs you in *correctness*,
+# and the answer is: nothing, but only if you carry the mask.
 
 # %%
-# TODO
+import time
+
+VOCAB, EMBED = 1024, 8
+emb_table = jax.random.normal(jax.random.PRNGKey(0), (VOCAB, EMBED), dtype=jnp.float32)
+
+traces = 0
+
+
+@jax.jit
+def prefill(emb, tokens, mask):
+    """Embed a prompt and reduce it, ignoring padded positions."""
+    global traces
+    # A side effect inside a jitted function runs at TRACE time, not call time.
+    # That is exactly what makes it a compile counter.
+    traces += 1
+    x = emb[tokens]
+    x = jnp.where(mask[..., None], x, 0.0)
+    return x.sum(axis=1)
+
+
+def run(n):
+    tokens = jnp.ones((1, n), dtype=jnp.int32)
+    mask = jnp.ones((1, n), dtype=jnp.bool_)
+    start = time.perf_counter()
+    jax.block_until_ready(prefill(emb_table, tokens, mask))
+    return (time.perf_counter() - start) * 1e3
+
+
+lengths = [100, 101, 102, 250]
+
+traces = 0
+print("first time at each length")
+for n in lengths:
+    ms = run(n)
+    print(f"  len {n:4d}  {ms:8.1f} ms   traces: {traces}")
+
+print("\nsame lengths again")
+for n in lengths:
+    ms = run(n)
+    print(f"  len {n:4d}  {ms:8.1f} ms   traces: {traces}")
+
+# %% [markdown]
+# Four lengths, four compiles, and the second pass is free because those four
+# shapes are now in the cache. A server sees far more than four lengths.
+#
+# Now round every length up to a bucket. This is `pad_to_tpu_v6e_bucket` from
+# the source engine, reduced to its two moving parts — and note that it returns
+# **two** things.
+
+# %%
+BUCKETS = (64, 128, 256, 512, 1024, 2048, 4096, 8192)
+
+
+def nearest_bucket(seq_len):
+    for b in BUCKETS:
+        if b >= seq_len:
+            return b
+    return (seq_len + 127) // 128 * 128
+
+
+def pad_to_bucket(tokens, pad_token_id=0):
+    """Right-pad to a bucket. Returns (padded_tokens, mask) -- never just tokens."""
+    B, S = tokens.shape
+    bucket = nearest_bucket(S)
+    if bucket == S:
+        return tokens, jnp.ones((B, S), dtype=jnp.bool_)
+    pad_len = bucket - S
+    padded = jnp.pad(tokens, ((0, 0), (0, pad_len)), constant_values=pad_token_id)
+    mask = jnp.concatenate(
+        [jnp.ones((B, S), dtype=jnp.bool_), jnp.zeros((B, pad_len), dtype=jnp.bool_)],
+        axis=1,
+    )
+    return padded, mask
+
+
+traces = 0
+print("bucketed")
+for n in lengths:
+    tokens, mask = pad_to_bucket(jnp.ones((1, n), dtype=jnp.int32))
+    start = time.perf_counter()
+    jax.block_until_ready(prefill(emb_table, tokens, mask))
+    ms = (time.perf_counter() - start) * 1e3
+    print(f"  len {n:4d} -> {tokens.shape[1]:4d}  {ms:8.1f} ms   traces: {traces}")
+
+# %% [markdown]
+# Four lengths, two compiles — 100/101/102 all became 128. Bucketing trades
+# wasted FLOPs on pad positions for a bounded number of compiled programs, and
+# on a serving path that is a good trade.
+#
+# ### What the padding costs, and the way it silently doesn't
+#
+# Padding is free *correctness-wise* only because the mask zeroes the pad
+# positions before they reach the reduction. Drop the mask and nothing raises —
+# you simply get a different answer.
+
+# %%
+prompt = jax.random.randint(jax.random.PRNGKey(1), (1, 100), 1, VOCAB)
+exact = prefill(emb_table, prompt, jnp.ones((1, 100), dtype=jnp.bool_))
+
+padded, mask = pad_to_bucket(prompt)
+with_mask = prefill(emb_table, padded, mask)
+
+# The same padded input, with every position claimed to be real.
+all_true = jnp.ones(padded.shape, dtype=jnp.bool_)
+without_mask = prefill(emb_table, padded, all_true)
+
+print(f"shape {prompt.shape[1]} -> {padded.shape[1]}")
+print(f"  padded + mask   max |diff| = {jnp.abs(with_mask - exact).max():.3e}")
+print(f"  padded, no mask max |diff| = {jnp.abs(without_mask - exact).max():.3e}")
+
+assert jnp.allclose(with_mask, exact, rtol=1e-6, atol=1e-6), "masked padding changed the result"
+print("\nmasked padding agrees to float32 tolerance; unmasked padding does not")
+
+# %% [markdown]
+# The two differences are not the same kind of thing. Masked padding came out at
+# exactly `0.000e+00` — adding zeros cannot change a sum, so the padded program
+# returned the identical float32. That is not guaranteed in general: a different
+# length can make XLA group the reduction differently and move the last bits,
+# which is why the assertion above uses a tolerance rather than `array_equal`.
+# Unmasked padding is wrong by a wide margin, and raised nothing.
+#
+# The source engine documents a nastier version of this trap. Its KV cache is
+# **not** filled contiguously: the server pads each prompt to a bucket, then
+# decodes at `bucket + step` while the logical position tracks the real length.
+# So the pad slots sit *inside* the filled range, and the obvious shortcut —
+# "everything below the write cursor is real" — attends to pad K/V. Quoting the
+# source: it "corrupts the output with no error at all."
+#
+# Padding is cheap. Forgetting what you padded is not.
 
 # %% [markdown]
 # ## 2. Buffer donation
