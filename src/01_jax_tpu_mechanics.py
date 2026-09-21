@@ -588,16 +588,134 @@ for ctx in (256, 1024, 2048, 4096, 8192):
 # is a constant, to 0.0%") and section 2c of `2026-07-28-jax-e2b-v6e1/REPORT.md`
 # ("we are memory-limited, not latency-limited").
 #
-# The point: single-token decode moves the whole KV cache through memory every
-# step, so it is bandwidth-bound, not compute-bound. Derive bytes/token, divide
-# by the chip's HBM bandwidth, compare to the measured step time. When those
-# two agree you have understood the machine.
+# Section 3 ended with the cached step time barely moving as context grew. Here
+# is why, and it is not because the work was small.
 #
-# This is also the honest framing for why the int8 KV cache in the next section
-# helps: it is a bandwidth cut, not a math cut.
+# To emit one token, decode reads the **entire** KV cache. Not part of it — all
+# of it, every layer, every stored position. The arithmetic on top is one query
+# against those keys, which is nothing. So step time is set by how fast the chip
+# can move the cache out of HBM, and almost nothing else.
+#
+# That has a strange consequence, and it is the claim worth testing: if only the
+# total bytes matter, then **batch size and context length should be
+# interchangeable** as long as their product holds. 64 sequences of 32k should
+# cost the same as 1024 sequences of 2k.
+#
+# The source report measured exactly that, and titled the section "The decode
+# budget is a constant, to 0.0%". Let us see.
 
 # %%
-# TODO
+D_KV = 128
+TOKEN_BUDGET = 2**21  # 2,097,152 cached tokens, held fixed across every config
+BYTES_PER_TOKEN = 2 * D_KV * jnp.dtype(jnp.bfloat16).itemsize  # k and v
+
+print(f"bytes per cached token: 2 x {D_KV} x 2 = {BYTES_PER_TOKEN}")
+print(f"budget: {TOKEN_BUDGET:,} tokens = {TOKEN_BUDGET * BYTES_PER_TOKEN / 2**30:.2f} GiB of cache\n")
+
+
+@jax.jit
+def attend_over_cache(cache_k, cache_v, q):
+    """One query per sequence against every stored key. Reads the whole cache."""
+    scores = jnp.einsum("bqd,bsd->bqs", q, cache_k)
+    return jnp.einsum("bqs,bsd->bqd", jax.nn.softmax(scores, axis=-1), cache_v)
+
+
+def time_config(batch, ctx, repeats=10):
+    cache_k = jnp.zeros((batch, ctx, D_KV), dtype=jnp.bfloat16)
+    cache_v = jnp.zeros_like(cache_k)
+    q = jnp.ones((batch, 1, D_KV), dtype=jnp.bfloat16)
+
+    jax.block_until_ready(attend_over_cache(cache_k, cache_v, q))
+    start = time.perf_counter()
+    for _ in range(repeats):
+        jax.block_until_ready(attend_over_cache(cache_k, cache_v, q))
+    ms = (time.perf_counter() - start) / repeats * 1e3
+
+    del cache_k, cache_v, q
+    return ms
+
+
+configs = [(1024, 2048), (512, 4096), (256, 8192), (128, 16384), (64, 32768)]
+cache_bytes_total = TOKEN_BUDGET * BYTES_PER_TOKEN
+
+print(f"{'batch':>6} {'context':>8} {'tokens':>12} {'step':>10} {'GB/s':>9}")
+budget_times = []
+for batch, ctx in configs:
+    ms = time_config(batch, ctx)
+    budget_times.append(ms)
+    gbs = cache_bytes_total / (ms * 1e-3) / 1e9
+    print(f"{batch:>6} {ctx:>8} {batch * ctx:>12,} {ms:>8.3f} ms {gbs:>8.1f}")
+
+spread = (max(budget_times) - min(budget_times)) / min(budget_times) * 100
+print(f"\nsame token budget, 16x range of batch size: step time spread {spread:.1f}%")
+
+# %% [markdown]
+# Batch and context moved by 16x in opposite directions and the step time barely
+# noticed. The chip is not a batch-size machine or a context-length machine. It
+# is a **bytes machine**, and `batch x context` is the only number it responds
+# to.
+#
+# This is why `max_batch_size` is the wrong knob for an admission policy. Two
+# sequences of 32k cost what sixty-four of 1k cost; a batch limit prices them
+# the same when they are not. Track the sum of context lengths instead. (vLLM's
+# paged allocator already does this — the measurement agrees with that design
+# rather than improving on it.)
+#
+# ### Is it really bandwidth?
+#
+# The GB/s column above is a claim about the hardware, so check it against the
+# hardware. Measure roughly what this chip can stream, by reading an array of
+# similar size and doing almost nothing with it.
+
+# %%
+probe = jnp.zeros((cache_bytes_total // 2,), dtype=jnp.bfloat16)
+
+
+@jax.jit
+def stream(x):
+    return x.sum(dtype=jnp.float32)
+
+
+jax.block_until_ready(stream(probe))
+start = time.perf_counter()
+for _ in range(10):
+    jax.block_until_ready(stream(probe))
+stream_ms = (time.perf_counter() - start) / 10 * 1e3
+
+peak_gbs = probe.nbytes / (stream_ms * 1e-3) / 1e9
+decode_gbs = cache_bytes_total / (min(budget_times) * 1e-3) / 1e9
+
+print(f"pure read of {probe.nbytes / 2**30:.2f} GiB: {stream_ms:.3f} ms -> {peak_gbs:.1f} GB/s")
+print(f"best decode step above:                      {decode_gbs:.1f} GB/s")
+print(f"decode reaches {decode_gbs / peak_gbs * 100:.0f}% of what a bare read achieves")
+
+del probe
+
+# %% [markdown]
+# Decode lands close to the rate of a function whose entire job is to read
+# memory. There is no headroom being wasted on arithmetic, because there is
+# barely any arithmetic — the step is the read.
+#
+# Two things follow, and the second is the one people get wrong.
+#
+# **Latency is predictable from queue depth alone.** If step time tracks total
+# cached bytes, you can price a request before running it. The source engine
+# measured ~21 ms at half its budget and ~39 ms at full, on a 32 GB chip.
+#
+# **Making the math faster buys nothing.** A better kernel, lower-precision
+# arithmetic, a fused op — none of it moves a step that is waiting on memory.
+# The only lever that works is moving fewer bytes.
+#
+# Which is the whole case for an int8 KV cache, and the subject of section 5. It
+# is not a faster cache. It is a **smaller** one, and on a bytes machine that is
+# the same thing.
+#
+# One caveat from the source report, since the table above is too clean. Step
+# time is really `f(ctx * B) + g(B)`: weight application scales with batch, not
+# with cached bytes, so very large batches at short context sit slightly above
+# the line. The report saw this at `ctx=512`, where the budget needs `B=1296`.
+# The second term is small, but it is not zero, and it is why the spread above
+# is not literally 0%.
 
 # %% [markdown]
 # ## 5. An int8 KV cache

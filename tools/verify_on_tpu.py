@@ -41,6 +41,7 @@ import pathlib
 import shutil
 import subprocess
 import sys
+import time
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 OUT = ROOT / "notebooks"
@@ -122,7 +123,58 @@ def check_adc() -> bool:
     return True
 
 
-def verify(stem: str, tpu: str, keep: bool, auth: str) -> bool:
+def provision(auth: str, session: str, tpu: str, attempts: int) -> bool:
+    """Allocate a TPU runtime, retrying only failures that retrying can fix.
+
+    Two failures look similar from the outside and must not be treated alike:
+
+      "Backend rejected accelerator 'V6E1'"  -- no entitlement. Permanent.
+      "Service Unavailable" (HTTP 503)       -- no free chips right now, or the
+                                                account's TPU allowance is spent.
+                                                Often clears on its own.
+
+    Retrying the first wastes minutes to arrive at the same answer, so it exits
+    immediately. Observed 2026-09-20: v5e-1 returned 503 for a stretch while a
+    CPU runtime provisioned normally, which is how you tell capacity apart from
+    an auth or account problem.
+    """
+    for attempt in range(1, attempts + 1):
+        result = colab(auth, "new", "-s", session, "--tpu", tpu, capture_output=True)
+        text = (result.stdout or "") + (result.stderr or "")
+        if result.returncode == 0:
+            print("  READY")
+            return True
+
+        if "rejected accelerator" in text:
+            print(
+                f"  {tpu} is not entitled on this account -- retrying will not help",
+                file=sys.stderr,
+            )
+            return False
+
+        transient = "Service Unavailable" in text or "503" in text
+        label = "no capacity" if transient else "failed"
+        print(f"  attempt {attempt}/{attempts}: {label}", file=sys.stderr)
+
+        if not transient:
+            print(text.strip()[-500:], file=sys.stderr)
+            return False
+        if attempt == attempts:
+            print(
+                f"  no {tpu} capacity after {attempts} attempts. A CPU runtime\n"
+                f"  provisioning normally would confirm it is capacity, not auth:\n"
+                f"      colab --auth {auth} new -s probe && colab --auth {auth} stop -s probe",
+                file=sys.stderr,
+            )
+            return False
+
+        wait = 30 * attempt
+        print(f"  waiting {wait}s", file=sys.stderr, flush=True)
+        time.sleep(wait)
+    return False
+
+
+def verify(stem: str, tpu: str, keep: bool, auth: str, attempts: int = 3) -> bool:
     notebook = OUT / f"{stem}.ipynb"
     if not notebook.exists():
         print(f"not built: {notebook} — run `make build` first", file=sys.stderr)
@@ -133,9 +185,7 @@ def verify(stem: str, tpu: str, keep: bool, auth: str) -> bool:
     executed.unlink(missing_ok=True)
 
     print(f"\n=== {stem} on --tpu {tpu} (auth: {auth}) ===", flush=True)
-    created = colab(auth, "new", "-s", session, "--tpu", tpu)
-    if created.returncode != 0:
-        print(f"could not provision a {tpu} runtime", file=sys.stderr)
+    if not provision(auth, session, tpu, attempts):
         return False
 
     try:
@@ -181,6 +231,12 @@ def main() -> int:
     parser.add_argument("--tpu", help="override accelerator; default comes from notebooks.json")
     parser.add_argument("--keep", action="store_true", help="do not stop the runtime")
     parser.add_argument(
+        "--attempts",
+        type=int,
+        default=3,
+        help="provisioning attempts before giving up on transient capacity errors",
+    )
+    parser.add_argument(
         "--auth",
         choices=("adc", "oauth2"),
         default="adc",
@@ -208,7 +264,7 @@ def main() -> int:
             print(f"unknown notebook: {stem}", file=sys.stderr)
             return 1
         tpu = args.tpu or entries[stem].get("tpu", "v5e1")
-        if not verify(stem, tpu, args.keep, args.auth):
+        if not verify(stem, tpu, args.keep, args.auth, args.attempts):
             failed.append(stem)
 
     print(f"\n{len(stems) - len(failed)}/{len(stems)} notebooks verified")
