@@ -50,6 +50,14 @@ spending compute units.** Check `make sessions` and `colab stop -s <name>` if a 
   carry over; absolute capacity figures will not.
 - `jupyter-kernel-client` is pinned to `0.15.0` — see the comment in `requirements-dev.txt`. Unpinning
   breaks `colab exec` while leaving provisioning working, so the failure looks like a notebook problem.
+- **Never retry `colab new` after a timeout.** A 503 is a refusal and nothing was allocated. A
+  `ReadTimeout` is silence, and the runtime may exist anyway — retrying builds another. On 2026-09-20
+  that produced three orphaned v5e-1 runtimes, which `colab sessions` shows as `[?]` rows and which
+  `colab stop -s` **cannot kill**, because it resolves names from `~/.config/colab-cli/sessions.json`.
+  They bill until they idle out or a human ends them at
+  colab.research.google.com → Runtime → Manage sessions. `provision()` in `tools/verify_on_tpu.py`
+  encodes this: it retries a 503 only, and bails with instructions on a timeout or
+  `TooManyAssignments`. If verification starts failing for no reason, check for `[?]` rows first.
 
 ## Writing notebook content
 

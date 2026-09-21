@@ -129,14 +129,18 @@ def provision(auth: str, session: str, tpu: str, attempts: int) -> bool:
     Two failures look similar from the outside and must not be treated alike:
 
       "Backend rejected accelerator 'V6E1'"  -- no entitlement. Permanent.
-      "Service Unavailable" (HTTP 503)       -- no free chips right now, or the
-                                                account's TPU allowance is spent.
-                                                Often clears on its own.
+      "Service Unavailable" (HTTP 503)       -- refused, nothing allocated.
+                                                Safe to retry; often clears.
+      ReadTimeout / ConnectionError          -- SILENCE, not refusal. The
+                                                runtime may exist. Never retry.
+      "TooManyAssignments"                   -- you already hold runtimes,
+                                                probably orphans. Go look.
 
-    Retrying the first wastes minutes to arrive at the same answer, so it exits
-    immediately. Observed 2026-09-20: v5e-1 returned 503 for a stretch while a
-    CPU runtime provisioned normally, which is how you tell capacity apart from
-    an auth or account problem.
+    Only the 503 is retried. See the comment in the loop for what retrying a
+    timeout cost on 2026-09-20.
+
+    Observed the same day: v5e-1 returned 503 while a CPU runtime provisioned
+    normally, which is how you tell capacity apart from an auth problem.
     """
     for attempt in range(1, attempts + 1):
         result = colab(auth, "new", "-s", session, "--tpu", tpu, capture_output=True)
@@ -152,13 +156,42 @@ def provision(auth: str, session: str, tpu: str, attempts: int) -> bool:
             )
             return False
 
-        transient = "Service Unavailable" in text or "503" in text
-        label = "no capacity" if transient else "failed"
-        print(f"  attempt {attempt}/{attempts}: {label}", file=sys.stderr)
+        # A timeout is NOT retryable, and this is the expensive lesson.
+        #
+        # A 503 is a refusal: nothing was built. A ReadTimeout is silence --
+        # the assign request may well have succeeded and left a runtime the CLI
+        # never got told about. Retrying then builds another. Doing that twice
+        # on 2026-09-20 produced three orphaned v5e-1 runtimes that
+        # `colab sessions` shows as `[?]`, that `colab stop -s` cannot address
+        # because it resolves names from local metadata, and that then tripped
+        # TooManyAssignmentsError on every further attempt. They bill until
+        # they idle out or a human kills them in the Colab UI.
+        if any(m in text for m in ("ReadTimeout", "Read timed out", "ConnectionError")):
+            print(
+                "  timed out -- NOT retrying: the runtime may exist despite the timeout.\n"
+                "  Check for orphans and clear them before trying again:\n"
+                f"      colab --auth {auth} sessions        # `[?]` rows are orphans\n"
+                "      https://colab.research.google.com/  Runtime > Manage sessions",
+                file=sys.stderr,
+            )
+            return False
 
-        if not transient:
+        if "TooManyAssignments" in text:
+            print(
+                "  assignment cap reached -- you are already holding runtimes.\n"
+                f"      colab --auth {auth} sessions\n"
+                "      https://colab.research.google.com/  Runtime > Manage sessions",
+                file=sys.stderr,
+            )
+            return False
+
+        if "Service Unavailable" not in text and "503" not in text:
+            print(f"  attempt {attempt}/{attempts}: failed", file=sys.stderr)
             print(text.strip()[-500:], file=sys.stderr)
             return False
+
+        # Only a clean 503 reaches here: refused, nothing allocated, safe to retry.
+        print(f"  attempt {attempt}/{attempts}: no capacity", file=sys.stderr)
         if attempt == attempts:
             print(
                 f"  no {tpu} capacity after {attempts} attempts. A CPU runtime\n"
