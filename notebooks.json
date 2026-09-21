@@ -1,5 +1,5 @@
 {
-  "repo": "xbill9/codelab-jax",
+  "repo": "xbill9/colab-jax",
   "branch": "main",
   "notebooks": {
     "01_jax_tpu_mechanics.py": {

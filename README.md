@@ -1,4 +1,4 @@
-# codelab-jax
+# colab-jax
 
 Colab notebooks for the AI GDE **Marathon: JAX on TPU Tutorial**. Apache 2.0.
 
