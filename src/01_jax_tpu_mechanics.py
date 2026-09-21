@@ -381,19 +381,205 @@ except Exception as exc:
 # %% [markdown]
 # ## 3. Cached decode, and proving it correct
 #
-# SOURCE: `~/tpu-jax/tests/test_kv_cache_parity.py` — "cached decode matches
-# full-sequence re-forward within float32 tolerance".
+# SOURCE: `~/tpu-jax/tests/test_kv_cache_parity.py`, including its `LOGIT_TOL`
+# and the top-2 gap rule in `assert_parity`.
 #
-# Beats to hit:
-# - A toy attention block, run two ways: full re-forward over the whole prefix
-#   each step, vs. append-to-cache with `lax.dynamic_update_slice`.
-# - Assert `allclose`. This is the test that catches an off-by-one in the write
-#   index, which is the most common way a hand-rolled cache goes wrong.
-# - Plot tokens/s for both as sequence length grows: the re-forward curve is
-#   quadratic, the cached one flat.
+# A KV cache is a claim: *attending to a stored key is the same as recomputing
+# it.* Nothing enforces that claim. An off-by-one in the write index produces
+# fluent, confident, wrong text, and no exception anywhere.
+#
+# So you write both paths and compare them. Below, the same toy attention runs
+# as a full re-forward over the whole prefix each step, and as a cached decode
+# that appends one key/value and attends to the stored ones.
 
 # %%
-# TODO
+import functools
+
+B, T_PROMPT, D_MODEL, VOCAB3 = 2, 7, 64, 256
+SCALE = D_MODEL**-0.5
+
+
+def make_params(seed=0):
+    keys = jax.random.split(jax.random.PRNGKey(seed), 5)
+    scale = 0.1
+    return {
+        "emb": jax.random.normal(keys[0], (VOCAB3, D_MODEL)) * scale,
+        "Wq": jax.random.normal(keys[1], (D_MODEL, D_MODEL)) * scale,
+        "Wk": jax.random.normal(keys[2], (D_MODEL, D_MODEL)) * scale,
+        "Wv": jax.random.normal(keys[3], (D_MODEL, D_MODEL)) * scale,
+        "Wo": jax.random.normal(keys[4], (D_MODEL, VOCAB3)) * scale,
+    }
+
+
+@jax.jit
+def forward_full(params, tokens):
+    """Reference: re-run attention over the entire sequence, every step."""
+    x = params["emb"][tokens]
+    q, k, v = x @ params["Wq"], x @ params["Wk"], x @ params["Wv"]
+    scores = jnp.einsum("btd,bsd->bts", q, k) * SCALE
+    t = tokens.shape[1]
+    scores = jnp.where(jnp.tril(jnp.ones((t, t), dtype=bool)), scores, -jnp.inf)
+    h = jnp.einsum("bts,bsd->btd", jax.nn.softmax(scores, axis=-1), v)
+    return h[:, -1] @ params["Wo"]
+
+
+@functools.partial(jax.jit, static_argnames=("offset",))
+def decode_one(params, cache_k, cache_v, token, pos, offset=0):
+    """Cached: append one key/value, attend to everything stored so far.
+
+    `offset` exists only so the next cell can introduce an off-by-one on
+    purpose. Real code would not have it.
+    """
+    x = params["emb"][token]
+    q, k, v = x @ params["Wq"], x @ params["Wk"], x @ params["Wv"]
+    write_at = pos + offset
+    cache_k = jax.lax.dynamic_update_slice(cache_k, k, (0, write_at, 0))
+    cache_v = jax.lax.dynamic_update_slice(cache_v, v, (0, write_at, 0))
+    scores = jnp.einsum("bqd,bsd->bqs", q, cache_k) * SCALE
+    live = jnp.arange(cache_k.shape[1]) <= pos
+    scores = jnp.where(live, scores, -jnp.inf)
+    h = jnp.einsum("bqs,bsd->bqd", jax.nn.softmax(scores, axis=-1), cache_v)
+    return cache_k, cache_v, h[:, 0] @ params["Wo"]
+
+
+def greedy_reference(params, prompt, n_new):
+    """Grow the sequence and re-forward the whole thing each step."""
+    tokens, logits = prompt, []
+    for _ in range(n_new):
+        lg = forward_full(params, tokens)
+        logits.append(lg)
+        tokens = jnp.concatenate([tokens, jnp.argmax(lg, -1)[:, None]], axis=1)
+    return tokens[:, prompt.shape[1] :], logits
+
+
+def greedy_cached(params, prompt, n_new, capacity, offset=0):
+    """Prefill once, then one cached step per new token."""
+    cache_k = jnp.zeros((prompt.shape[0], capacity, D_MODEL), jnp.float32)
+    cache_v = jnp.zeros_like(cache_k)
+
+    # Prefill: write every prompt key/value, read logits at the last position.
+    x = params["emb"][prompt]
+    cache_k = cache_k.at[:, : prompt.shape[1]].set(x @ params["Wk"])
+    cache_v = cache_v.at[:, : prompt.shape[1]].set(x @ params["Wv"])
+    lg = forward_full(params, prompt)
+
+    out, logits = [], []
+    for step in range(n_new):
+        logits.append(lg)
+        token = jnp.argmax(lg, -1)[:, None]
+        out.append(token)
+        cache_k, cache_v, lg = decode_one(params, cache_k, cache_v, token, prompt.shape[1] + step, offset)
+    return jnp.concatenate(out, axis=1), logits
+
+
+params3 = make_params()
+prompt3 = jax.random.randint(jax.random.PRNGKey(42), (B, T_PROMPT), 1, VOCAB3)
+N_NEW = 8
+
+ref_tokens, ref_logits = greedy_reference(params3, prompt3, N_NEW)
+cac_tokens, cac_logits = greedy_cached(params3, prompt3, N_NEW, T_PROMPT + N_NEW)
+
+worst = max(float(jnp.abs(r - c).max()) for r, c in zip(ref_logits, cac_logits))
+print(f"worst logit difference over {N_NEW} steps: {worst:.3e}")
+print(f"tokens identical: {bool(jnp.array_equal(ref_tokens, cac_tokens))}")
+
+# %% [markdown]
+# The logits differ a little. They are supposed to. The two paths sum the same
+# attention in a different order, and float32 addition is not associative — the
+# source test allows `1e-4` and reports a measured worst case around `1e-6`.
+#
+# That gap has a consequence most people discover the hard way. If two tokens
+# are nearly tied for the argmax, a difference of `1e-6` is enough to swap
+# them, and your parity test fails on a decode that is completely correct.
+#
+# So the source test does not assert tokens are equal. It asserts they are equal
+# **wherever the decision was not a near-tie**:
+
+# %%
+for i, (r, c) in enumerate(zip(ref_logits, cac_logits)):
+    ordered = jnp.sort(r, axis=-1)
+    gap = ordered[:, -1] - ordered[:, -2]  # top-2 margin, per row
+    delta = jnp.abs(r - c).max(axis=-1)
+    for row in range(r.shape[0]):
+        decisive = float(gap[row]) > float(delta[row])
+        same = int(ref_tokens[row, i]) == int(cac_tokens[row, i])
+        if decisive:
+            assert same, f"step {i} row {row}: differs on a decisive margin"
+    print(f"step {i}: top-2 margins {[round(float(g), 4) for g in gap]}, max |dlogit| {float(delta.max()):.2e}")
+
+print("\nevery decisive step agreed")
+
+# %% [markdown]
+# ### Does the test actually catch anything?
+#
+# A test that has never failed is a rumour. The most common way a hand-rolled
+# cache breaks is an off-by-one in the write index — the key lands one slot
+# late, the query attends to a stale zero, and the output is confidently wrong.
+#
+# `decode_one` takes an `offset` argument for exactly this. Set it to 1:
+
+# %%
+bad_tokens, bad_logits = greedy_cached(params3, prompt3, N_NEW, T_PROMPT + N_NEW + 1, offset=1)
+
+bad_worst = max(float(jnp.abs(r - c).max()) for r, c in zip(ref_logits, bad_logits))
+print(f"off-by-one worst logit difference: {bad_worst:.3e}   (correct path: {worst:.3e})")
+print(f"off-by-one tokens identical:       {bool(jnp.array_equal(ref_tokens, bad_tokens))}")
+print(f"\nreference tokens: {ref_tokens.tolist()}")
+print(f"off-by-one tokens: {bad_tokens.tolist()}")
+print("\nno exception was raised by the broken path.")
+
+# %% [markdown]
+# ### Why bother with the cache at all
+#
+# Re-forwarding is simpler and always correct. It is also quadratic: step *t*
+# recomputes every key and value for tokens *0..t* that it already computed at
+# step *t-1*, and builds a `[T, T]` score matrix to do it. The cached step
+# computes one key, one value, and a `[1, T]` score row.
+#
+# Watch where that starts to matter. It is further out than you might guess.
+
+# %%
+print(f"{'context':>8}  {'re-forward':>12}  {'cached step':>12}  {'ratio':>7}")
+for ctx in (256, 1024, 2048, 4096, 8192):
+    toks = jax.random.randint(jax.random.PRNGKey(2), (1, ctx), 1, VOCAB3)
+    ck = jnp.zeros((1, ctx + 1, D_MODEL), jnp.float32)
+    cv = jnp.zeros_like(ck)
+    one = toks[:, :1]
+
+    jax.block_until_ready(forward_full(params3, toks))
+    jax.block_until_ready(decode_one(params3, ck, cv, one, ctx - 1))
+
+    start = time.perf_counter()
+    for _ in range(10):
+        jax.block_until_ready(forward_full(params3, toks))
+    full_ms = (time.perf_counter() - start) * 1e2
+
+    start = time.perf_counter()
+    for _ in range(10):
+        jax.block_until_ready(decode_one(params3, ck, cv, one, ctx - 1))
+    cached_ms = (time.perf_counter() - start) * 1e2
+
+    print(f"{ctx:>8}  {full_ms:>10.3f} ms  {cached_ms:>10.3f} ms  {full_ms / cached_ms:>6.1f}x")
+
+# %% [markdown]
+# Two things in that table, and the second is the more useful one.
+#
+# The cached column is roughly flat while the re-forward column climbs with
+# context, which is the asymptotic story: `O(T^2)` against `O(T)`.
+#
+# But at the short end the ratio is **below 1** — the cache is *slower*. There
+# is so little arithmetic in a 256-token attention at this width that both
+# columns are measuring dispatch overhead, and the cached path has slightly more
+# of it: an extra `dynamic_update_slice` and its own kernel launch. The cache
+# does not begin paying for itself until the work it avoids is bigger than the
+# work it adds.
+#
+# That is worth carrying around. "Cached decode is faster than re-forwarding" is
+# a statement about large contexts. At small ones it is false, and a benchmark
+# run only at small ones would tell you so confidently.
+#
+# The flatness of the cached column is what section 4 is about — and it is flat
+# for a reason that has nothing to do with arithmetic.
 
 # %% [markdown]
 # ## 4. The decode budget is a constant
